@@ -77,28 +77,25 @@ process_file() {
   mkdir -p "$TMP_BASE"
 
   TMPDIR="$(mktemp -d "$TMP_BASE/tmp.XXXXXX")"
-  trap 'rm -rf "$TMPDIR"' EXIT
+  trap 'rm -rf "$TMPDIR"; rmdir "$TMP_BASE" 2>/dev/null || true' EXIT
 
   TMP_COVER="$TMPDIR/cover_tmp.jpg"
   FIXED_COVER="$TMPDIR/cover_fixed.jpg"
 
 # get current artwork
   if ! ffmpeg -y -i "$f" -an -frames:v 1 "$TMP_COVER" 2>/dev/null; then
-    return
+    if ! metaflac --export-picture-to="$TMP_COVER" "$f" 2>/dev/null; then
+      rm -f "$TMP_COVER"
+      return
+    fi
   fi
 
-  # skip if already baseline artwork
-if INTERLACE="$(identify -quiet -format '%[interlace]' "$TMP_COVER" 2>/dev/null)"; then
-  if [[ "${INTERLACE,,}" == "none" ]]; then
-    rm -f "$TMP_COVER"
-    return
+  local INTERLACE="unknown"
+  if INTERLACE="$(identify -quiet -format '%[interlace]' "$TMP_COVER" 2>/dev/null)"; then
+    INTERLACE="${INTERLACE,,}"
   fi
-else
-  rm -f "$TMP_COVER"
-  return
-fi
 
-  echo "Fixing: $f"
+  echo "Fixing: $f (interlace: $INTERLACE)"
 
   # convert to baseline JPEG
   convert "$TMP_COVER" \
