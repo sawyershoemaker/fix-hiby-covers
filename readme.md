@@ -8,7 +8,6 @@ This script converts covers back to baseline JPEGs and re-embeds them into the F
 
 - Give it either a Windows path (`C:\Music`) or a WSL path (`/mnt/d/Music`) to the root of the songs that need conversion.
 - It will go through every `.flac` and extrect the current cover with `ffmpeg`.
-- If files already have baseline art (interlace `None`) then it will skip them to avoid any unneeded processing.
 - Then it re-encodes progressive covers with ImageMagick (`convert`) to a baseline JPEG, strips metadata, caps size at 1000x1000, and writes it back with `metaflac`. I found any bigger than 1000x1000 it either had issues displaying or was not worth the space.
 - It also runs work in parallel (`nproc` workers) to deal with large libraries efficiently.
 
