@@ -90,12 +90,22 @@ process_file() {
     fi
   fi
 
-  local INTERLACE="unknown"
-  if INTERLACE="$(identify -quiet -format '%[interlace]' "$TMP_COVER" 2>/dev/null)"; then
+  local IDENT_OUTPUT INTERLACE="unknown" WIDTH="0" HEIGHT="0"
+  if IDENT_OUTPUT="$(identify -quiet -format '%[interlace] %w %h' "$TMP_COVER" 2>/dev/null)"; then
+    read -r INTERLACE WIDTH HEIGHT <<<"$IDENT_OUTPUT"
     INTERLACE="${INTERLACE,,}"
+  else
+    rm -f "$TMP_COVER"
+    return
   fi
 
-  echo "Fixing: $f (interlace: $INTERLACE)"
+  if [[ "$INTERLACE" == "none" ]] && (( WIDTH <= 1000 )) && (( HEIGHT <= 1000 )); then
+    echo "Skipping (already baseline <=1000x1000): $f"
+    rm -f "$TMP_COVER"
+    return
+  fi
+
+  echo "Fixing: $f (interlace: $INTERLACE, size: ${WIDTH}x${HEIGHT})"
 
   # convert to baseline JPEG
   convert "$TMP_COVER" \
