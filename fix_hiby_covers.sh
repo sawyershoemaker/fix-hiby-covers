@@ -4,34 +4,39 @@ set -euo pipefail
 readonly RST=$'\033[0m'
 readonly BOLD=$'\033[1m'
 readonly DIM=$'\033[2m'
-readonly ITAL=$'\033[3m'
 
 #colors
 readonly RED=$'\033[38;5;203m'
 readonly GREEN=$'\033[38;5;114m'
 readonly YELLOW=$'\033[38;5;221m'
 readonly BLUE=$'\033[38;5;74m'
-readonly PURPLE=$'\033[38;5;176m'
 readonly CYAN=$'\033[38;5;80m'
 readonly ORANGE=$'\033[38;5;215m'
 readonly GRAY=$'\033[38;5;245m'
 readonly WHITE=$'\033[38;5;255m'
 
-#background
-readonly BG_GREEN=$'\033[48;5;22m'
-readonly BG_RED=$'\033[48;5;52m'
-readonly BG_BLUE=$'\033[48;5;24m'
+REQUIRED_CMDS=(metaflac wslpath mktemp stat parallel)
+REQUIRED_PKGS=(flac coreutils parallel)
 
-#progbar
-readonly BAR_FULL="="
-readonly BAR_EMPTY="-"
+# prefer vips over imagemagick if available
+USE_VIPS=0
+if command -v vipsthumbnail >/dev/null 2>&1; then
+  USE_VIPS=1
+else
+  REQUIRED_CMDS+=(convert identify)
+  REQUIRED_PKGS+=(imagemagick)
+fi
 
-REQUIRED_CMDS=(metaflac convert wslpath identify mktemp stat)
-REQUIRED_PKGS=(flac imagemagick coreutils)
-
+JOBS=$(nproc 2>/dev/null || echo 4)
 TERM_WIDTH=$(tput cols 2>/dev/null || echo 80)
 (( TERM_WIDTH > 100 )) && TERM_WIDTH=100
 
+# use RAM disk if available for temp files
+if [[ -d /dev/shm && -w /dev/shm ]]; then
+  TMPBASE="/dev/shm/hiby_$$"
+else
+  TMPBASE="/tmp/hiby_$$"
+fi
 
 # ui funcs
 print_section() {
@@ -60,25 +65,6 @@ warn() {
 
 check_command() {
   command -v "$1" >/dev/null 2>&1
-}
-
-# progress bar
-draw_progress_bar() {
-  local current=$1
-  local total=$2
-  local width=$((TERM_WIDTH - 35))
-  local pct=0
-  (( total > 0 )) && pct=$((current * 100 / total))
-  local filled=$((width * current / total))
-  (( filled > width )) && filled=$width
-  local empty=$((width - filled))
-  
-  local bar=""
-  (( filled > 0 )) && bar+="${GREEN}$(printf -- "${BAR_FULL}%.0s" $(seq 1 $filled))${RST}"
-  (( empty > 0 )) && bar+="${DIM}${GRAY}$(printf -- "${BAR_EMPTY}%.0s" $(seq 1 $empty))${RST}"
-  
-  printf "\r    ${DIM}[${RST}%s${DIM}]${RST} ${BOLD}${WHITE}%3d%%${RST}  ${GRAY}%d/%d${RST}  " \
-    "$bar" "$pct" "$current" "$total"
 }
 
 print_usage() {
@@ -114,7 +100,6 @@ fi
 
 CACHE_FILE="$ROOT/.hiby_covers.cache"
 
-
 # main
 print_section "Dependencies"
 
@@ -126,6 +111,7 @@ for cmd in "${REQUIRED_CMDS[@]}"; do
       metaflac) MISSING_PKGS+=(flac) ;;
       convert|identify) MISSING_PKGS+=(imagemagick) ;;
       mktemp|stat) MISSING_PKGS+=(coreutils) ;;
+      parallel) MISSING_PKGS+=(parallel) ;;
       *) MISSING_PKGS+=("$cmd") ;;
     esac
   fi
@@ -141,15 +127,31 @@ else
   success "All dependencies present"
 fi
 
+if (( USE_VIPS )); then
+  info "Using vips (faster)"
+else
+  info "Using ImageMagick"
+fi
+info "Parallel jobs: $JOBS"
+
 print_section "Cache"
 
-declare -A CACHE
+# setup work directory
+mkdir -p "$TMPBASE"
+trap 'rm -rf "$TMPBASE" 2>/dev/null || true; printf "\033[?25h"' EXIT
+
+CACHE_EXPORT="$TMPBASE/cache_in.tsv"
+RESULTS_DIR="$TMPBASE/results"
+FIXED_LOG="$TMPBASE/fixed.log"
+mkdir -p "$RESULTS_DIR"
+
+# export cache for parallel workers to read
 if [[ -f "$CACHE_FILE" ]] && (( FORCE_MODE == 0 )); then
-  while IFS=$'\t' read -r cached_path cached_mtime cached_status; do
-    [[ -n "$cached_path" ]] && CACHE["$cached_path"]="$cached_mtime|$cached_status"
-  done < "$CACHE_FILE"
-  success "Loaded ${BOLD}${#CACHE[@]}${RST}${WHITE} cached entries"
+  cp "$CACHE_FILE" "$CACHE_EXPORT"
+  CACHE_COUNT=$(wc -l < "$CACHE_EXPORT")
+  success "Loaded ${BOLD}${CACHE_COUNT}${RST}${WHITE} cached entries"
 else
+  touch "$CACHE_EXPORT"
   if (( FORCE_MODE == 1 )); then
     info "Force mode: ignoring cache"
   else
@@ -157,136 +159,196 @@ else
   fi
 fi
 
-# stats
-SKIPPED_CACHED=0
-SKIPPED_OK=0
-FIXED=0
-NO_COVER=0
-
-CACHE_TMP="$(mktemp)"
-trap 'rm -f "$CACHE_TMP" 2>/dev/null || true; printf "\033[?25h"' EXIT
-
-declare -a FIXED_FILES=()
-
-process_file() {
-  local f="$1"
-  local mtime status
-
-  mtime="$(stat -c '%Y' "$f" 2>/dev/null)" || return
-
-  if [[ -v CACHE["$f"] ]]; then
-    local cached="${CACHE["$f"]}"
-    local cached_mtime="${cached%%|*}"
-    local cached_status="${cached##*|}"
-    if [[ "$cached_mtime" == "$mtime" ]]; then
-      ((++SKIPPED_CACHED))
-      printf '%s\t%s\t%s\n' "$f" "$mtime" "$cached_status" >> "$CACHE_TMP"
-      return
-    fi
-  fi
-
-  local dir tmp_base tmpdir tmp_cover fixed_cover
-  dir="$(dirname "$f")"
-  tmp_base="$dir/.hiby_tmp"
-  mkdir -p "$tmp_base"
-  tmpdir="$(mktemp -d "$tmp_base/tmp.XXXXXX")"
-
-  tmp_cover="$tmpdir/cover_tmp.jpg"
-  fixed_cover="$tmpdir/cover_fixed.jpg"
-
-  if ! metaflac --export-picture-to="$tmp_cover" "$f" </dev/null 2>/dev/null; then
-    rm -rf "$tmpdir"
-    rmdir "$tmp_base" 2>/dev/null || true
-    ((++NO_COVER))
-    printf '%s\t%s\t%s\n' "$f" "$mtime" "NOCOV" >> "$CACHE_TMP"
-    return
-  fi
-
-  local ident_output interlace width height
-  interlace="unknown"
-  width=0
-  height=0
-
-  if ident_output="$(identify -quiet -format '%[interlace] %w %h' "$tmp_cover" </dev/null 2>/dev/null)"; then
-    read -r interlace width height <<<"$ident_output"
-    interlace="${interlace,,}"
-  fi
-
-  if [[ "$interlace" == "none" ]] && (( width <= 1000 )) && (( height <= 1000 )); then
-    ((++SKIPPED_OK))
-    printf '%s\t%s\t%s\n' "$f" "$mtime" "OK" >> "$CACHE_TMP"
-    rm -rf "$tmpdir"
-    rmdir "$tmp_base" 2>/dev/null || true
-    return
-  fi
-
-  local basename
-  basename="$(basename "$f")"
-  FIXED_FILES+=("${basename}|${interlace}|${width}x${height}")
-
-  convert "$tmp_cover" \
-    -resize 1000x1000\> \
-    -interlace none \
-    -strip \
-    "$fixed_cover" </dev/null
-
-  metaflac --remove --block-type=PICTURE "$f" </dev/null
-  metaflac --import-picture-from="$fixed_cover" "$f" </dev/null
-
-  local new_mtime
-  new_mtime="$(stat -c '%Y' "$f" 2>/dev/null)" || new_mtime="$mtime"
-
-  ((++FIXED))
-  printf '%s\t%s\t%s\n' "$f" "$new_mtime" "OK" >> "$CACHE_TMP"
-
-  rm -rf "$tmpdir"
-  rmdir "$tmp_base" 2>/dev/null || true
-}
-
 print_section "Scanning"
 info "Target: ${BOLD}${WHITE}$ROOT${RST}"
 
-printf "\033[?25l"
-
-TOTAL_FILES=$(find "$ROOT" -type f -iname "*.flac" 2>/dev/null | wc -l)
-CURRENT=0
+# single find pass - collect all files into array
+mapfile -d '' FILES < <(find "$ROOT" -type f -iname "*.flac" -print0 2>/dev/null)
+TOTAL_FILES=${#FILES[@]}
 
 if (( TOTAL_FILES == 0 )); then
   warn "No FLAC files found"
-else
-  info "Found ${BOLD}${WHITE}$TOTAL_FILES${RST}${GRAY} FLAC files"
-  echo
-
-  while IFS= read -r -d '' f; do
-    ((++CURRENT))
-    draw_progress_bar "$CURRENT" "$TOTAL_FILES"
-    process_file "$f"
-  done < <(find "$ROOT" -type f -iname "*.flac" -print0 2>/dev/null)
-
-  printf '\r%*s\r' "$TERM_WIDTH" ""
+  printf "\033[?25h"
+  exit 0
 fi
 
+info "Found ${BOLD}${WHITE}$TOTAL_FILES${RST}${GRAY} FLAC files"
+info "Processing with $JOBS parallel workers..."
+echo
+
+# worker script for GNU parallel
+WORKER_SCRIPT="$TMPBASE/worker.sh"
+cat > "$WORKER_SCRIPT" << 'WORKER_EOF'
+#!/usr/bin/env bash
+set -euo pipefail
+
+f="$1"
+CACHE_FILE="$2"
+RESULTS_DIR="$3"
+FIXED_LOG="$4"
+USE_VIPS="$5"
+TMPBASE="$6"
+
+# unique ID for this file
+FILE_HASH=$(echo "$f" | md5sum | cut -c1-12)
+RESULT_FILE="$RESULTS_DIR/$FILE_HASH"
+WORK_DIR="$TMPBASE/work_$FILE_HASH"
+mkdir -p "$WORK_DIR"
+
+cleanup() {
+  rm -rf "$WORK_DIR" 2>/dev/null || true
+}
+trap cleanup EXIT
+
+mtime="$(stat -c '%Y' "$f" 2>/dev/null)" || exit 0
+
+# check cache
+if [[ -f "$CACHE_FILE" ]]; then
+  cached_line=$(grep -F "$f"$'\t' "$CACHE_FILE" 2>/dev/null | head -1) || true
+  if [[ -n "$cached_line" ]]; then
+    cached_mtime=$(echo "$cached_line" | cut -f2)
+    cached_status=$(echo "$cached_line" | cut -f3)
+    if [[ "$cached_mtime" == "$mtime" ]]; then
+      printf '%s\t%s\t%s\tCACHED\n' "$f" "$mtime" "$cached_status" > "$RESULT_FILE"
+      exit 0
+    fi
+  fi
+fi
+
+tmp_cover="$WORK_DIR/cover.jpg"
+fixed_cover="$WORK_DIR/fixed.jpg"
+
+# extract cover
+if ! metaflac --export-picture-to="$tmp_cover" "$f" </dev/null 2>/dev/null; then
+  printf '%s\t%s\tNOCOV\tNOCOV\n' "$f" "$mtime" > "$RESULT_FILE"
+  exit 0
+fi
+
+# check image properties
+if (( USE_VIPS )); then
+  # vips gives dimensions, assume non-interlaced
+  dims=$(vipsheader -f width -f height "$tmp_cover" 2>/dev/null | tr '\n' ' ') || dims="0 0"
+  read -r width height <<< "$dims"
+  interlace="none"
+else
+  ident_output="$(identify -quiet -format '%[interlace] %w %h' "$tmp_cover" </dev/null 2>/dev/null)" || ident_output="unknown 0 0"
+  read -r interlace width height <<< "$ident_output"
+  interlace="${interlace,,}"
+fi
+
+width=${width:-0}
+height=${height:-0}
+
+if [[ "$interlace" == "none" ]] && (( width <= 1000 )) && (( height <= 1000 )); then
+  printf '%s\t%s\tOK\tOK\n' "$f" "$mtime" > "$RESULT_FILE"
+  exit 0
+fi
+
+# needs fixing
+basename="$(basename "$f")"
+
+if (( USE_VIPS )); then
+  vipsthumbnail "$tmp_cover" -s 1000x1000 -o "$fixed_cover" 2>/dev/null
+else
+  convert "$tmp_cover" -resize 1000x1000\> -interlace none -strip "$fixed_cover" </dev/null
+fi
+
+metaflac --remove --block-type=PICTURE "$f" </dev/null
+metaflac --import-picture-from="$fixed_cover" "$f" </dev/null
+
+new_mtime="$(stat -c '%Y' "$f" 2>/dev/null)" || new_mtime="$mtime"
+
+printf '%s\t%s\tOK\tFIXED\n' "$f" "$new_mtime" > "$RESULT_FILE"
+printf '%s|%s|%dx%d\n' "$basename" "$interlace" "$width" "$height" >> "$FIXED_LOG"
+WORKER_EOF
+chmod +x "$WORKER_SCRIPT"
+
+# hide cursor
+printf "\033[?25l"
+
+# progress monitor in background
+PROGRESS_PID=""
+(
+  while true; do
+    completed=$(find "$RESULTS_DIR" -type f 2>/dev/null | wc -l)
+    pct=0
+    (( TOTAL_FILES > 0 )) && pct=$((completed * 100 / TOTAL_FILES))
+    
+    # build progress bar
+    bar_width=50
+    filled=$((bar_width * completed / TOTAL_FILES))
+    (( filled > bar_width )) && filled=$bar_width
+    empty=$((bar_width - filled))
+    
+    bar=""
+    (( filled > 0 )) && bar+=$(printf '=%.0s' $(seq 1 $filled))
+    (( empty > 0 )) && bar+=$(printf -- '-%.0s' $(seq 1 $empty))
+    
+    printf "\r    [%s] %3d%%  %d/%d  " "$bar" "$pct" "$completed" "$TOTAL_FILES"
+    
+    (( completed >= TOTAL_FILES )) && break
+    sleep 0.2
+  done
+) &
+PROGRESS_PID=$!
+
+# run parallel (quiet, no bar)
+printf '%s\0' "${FILES[@]}" | parallel --null -j "$JOBS" \
+  "$WORKER_SCRIPT" {} "$CACHE_EXPORT" "$RESULTS_DIR" "$FIXED_LOG" "$USE_VIPS" "$TMPBASE" \
+  2>/dev/null
+
+# stop progress monitor
+kill "$PROGRESS_PID" 2>/dev/null || true
+wait "$PROGRESS_PID" 2>/dev/null || true
+
+# clear progress line
+printf '\r%*s\r' 80 ""
+
+# show cursor
 printf "\033[?25h"
 
+# aggregate results
+CACHE_TMP="$TMPBASE/cache_out.tsv"
+FIXED=0
+SKIPPED_OK=0
+SKIPPED_CACHED=0
+NO_COVER=0
+
+for result_file in "$RESULTS_DIR"/*; do
+  [[ -f "$result_file" ]] || continue
+  while IFS=$'\t' read -r fpath fmtime fstatus faction; do
+    printf '%s\t%s\t%s\n' "$fpath" "$fmtime" "$fstatus" >> "$CACHE_TMP"
+    case "$faction" in
+      CACHED) ((++SKIPPED_CACHED)) ;;
+      OK) ((++SKIPPED_OK)) ;;
+      FIXED) ((++FIXED)) ;;
+      NOCOV) ((++NO_COVER)) ;;
+    esac
+  done < "$result_file"
+done
+
+# save new cache
 mv "$CACHE_TMP" "$CACHE_FILE" 2>/dev/null || true
 
 # end summary
 print_section "Results"
 
-if (( ${#FIXED_FILES[@]} > 0 )); then
+if [[ -f "$FIXED_LOG" ]] && [[ -s "$FIXED_LOG" ]]; then
   echo
   printf "    ${ORANGE}Fixed files:${RST}\n"
   count=0
-  for entry in "${FIXED_FILES[@]}"; do
-    IFS='|' read -r fname finterlace fsize <<<"$entry"
+  while IFS='|' read -r fname finterlace fsize; do
     printf "      ${DIM}${GRAY}|${RST} ${WHITE}%s${RST} ${DIM}(${YELLOW}%s${DIM}, ${CYAN}%s${DIM})${RST}\n" \
       "$fname" "$finterlace" "$fsize"
     ((++count))
-    if (( count >= 10 && ${#FIXED_FILES[@]} > 10 )); then
-      printf "      ${DIM}${GRAY}+ ... and %d more${RST}\n" $(( ${#FIXED_FILES[@]} - 10 ))
+    if (( count >= 10 )); then
+      remaining=$(( $(wc -l < "$FIXED_LOG") - 10 ))
+      if (( remaining > 0 )); then
+        printf "      ${DIM}${GRAY}+ ... and %d more${RST}\n" "$remaining"
+      fi
       break
     fi
-  done
+  done < "$FIXED_LOG"
   echo
 fi
 
@@ -297,7 +359,7 @@ printf "    ${GREEN}Already OK:${RST}       %4d\n" "$SKIPPED_OK"
 printf "    ${CYAN}From cache:${RST}       %4d\n" "$SKIPPED_CACHED"
 printf "    ${GRAY}No cover:${RST}         %4d\n" "$NO_COVER"
 printf "    ${DIM}-------------------------${RST}\n"
-printf "    ${WHITE}Total processed:${RST}  %4d\n" "$CURRENT"
+printf "    ${WHITE}Total processed:${RST}  %4d\n" "$TOTAL_FILES"
 
 echo
 if (( FIXED > 0 )); then
