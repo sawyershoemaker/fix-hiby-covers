@@ -7,14 +7,14 @@ This script converts covers back to baseline JPEGs and re-embeds them into the F
 ## basic overview
 
 - Give it either a Windows path (`C:\Music`) or a WSL path (`/mnt/d/Music`) to the root of the songs that need conversion.
-- It will go through every `.flac` and extrect the current cover with `ffmpeg`.
-- Then it re-encodes progressive covers with ImageMagick (`convert`) to a baseline JPEG, strips metadata, caps size at 1000x1000, and writes it back with `metaflac`. I found any bigger than 1000x1000 it either had issues displaying or was not worth the space.
+- It will go through every `.flac` and extract the current cover with `metaflac`.
+- Then it re-encodes progressive covers with `vips` (or ImageMagick if vips isn't installed) to a baseline JPEG, strips metadata, caps size at 1000x1000, and writes it back with `metaflac`. I found any bigger than 1000x1000 it either had issues displaying or was not worth the space.
 - Before extracting the cover it will check if the current cover is <=1000x1000 and baseline to skip ones that it has already converted.
-- It also runs work in parallel (`nproc` workers) to deal with large libraries efficiently.
+- It also runs work in parallel with GNU `parallel` (`nproc` workers) to deal with large libraries efficiently.
 
 ## requirements
 
-- You'll need WSL with `ffmpeg`, `flac`, `imagemagick`, and the typical shell utilities.
+- You'll need WSL with `flac`, `imagemagick` (or `libvips-tools` for faster processing), `parallel`, and the typical shell utilities.
 - It's setup to attempt `sudo apt install` for anything missing, so you'll need sudo rights the first time or preinstall the aforementioned packages before running and run w/o sudo.
 
 ## syntax
